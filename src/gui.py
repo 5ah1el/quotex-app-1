@@ -2,7 +2,7 @@ import asyncio
 import os
 import sys
 import threading
-import webbrowser
+import time
 from datetime import datetime
 from typing import Dict, List
 
@@ -14,7 +14,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.data_storage import DataStorage
 from src.signal_engine import SignalEngine
-from src.yahoo_connector import YahooConnector
+from src.twelve_data_connector import TwelveDataConnector
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
@@ -53,7 +53,7 @@ class QuotexOTCApp(ctk.CTk):
         self.title("Quotex OTC Signal Bot")
         self.geometry("1400x900")
 
-        self.connector = YahooConnector()
+        self.connector = TwelveDataConnector()
         self.signal_engine = SignalEngine()
         self.storage = DataStorage()
 
@@ -61,11 +61,16 @@ class QuotexOTCApp(ctk.CTk):
         self.running = False
         self.paused = False
         self.total_signals = 0
+        self.win_count = 0
+        self.loss_count = 0
+        self.safety_margin_seconds = 3
+        self.scan_in_progress = False
+        self.last_scan_bucket = None
 
         self.status_var = ctk.StringVar(value="Status: Stopped")
-        self.market_var = ctk.StringVar(value="Data: LIVE OTC Proxy")
+        self.market_var = ctk.StringVar(value="Data: LIVE Forex Proxy for OTC")
         self.timeframe_var = ctk.StringVar(value="60")
-        self.source_var = ctk.StringVar(value="Yahoo Finance Polling (Live OTC Proxy)")
+        self.source_var = ctk.StringVar(value="Twelve Data Polling (Live Forex/Metals Proxy)")
 
         self.setup_ui()
 
@@ -79,7 +84,7 @@ class QuotexOTCApp(ctk.CTk):
 
         self.logo_label = ctk.CTkLabel(
             self.sidebar,
-            text="OTC Signal Bot",
+            text="Quotex OTC Bot",
             font=ctk.CTkFont(size=24, weight="bold"),
         )
         self.logo_label.pack(pady=(20, 10))
@@ -157,7 +162,7 @@ class QuotexOTCApp(ctk.CTk):
 
         self.safety_label = ctk.CTkLabel(
             self.tf_frame,
-            text="Live OTC proxy prices refresh on each scan",
+            text=f"Signal trigger: {self.safety_margin_seconds}s before candle close",
             text_color="#ffc107",
             font=ctk.CTkFont(size=11, weight="bold"),
         )
@@ -179,16 +184,6 @@ class QuotexOTCApp(ctk.CTk):
         self.pair_vars: Dict[str, ctk.BooleanVar] = {}
         self.update_market_list("Major Currency OTC")
 
-        self.chart_btn = ctk.CTkButton(
-            self.sidebar,
-            text="Open TradingView",
-            command=self.open_chart,
-            fg_color="#1f538d",
-            hover_color="#14375e",
-            height=35,
-        )
-        self.chart_btn.pack(fill="x", padx=20, pady=5)
-
         self.sel_btn_frame = ctk.CTkFrame(self.sidebar, fg_color="transparent")
         self.sel_btn_frame.pack(fill="x", padx=10, pady=(5, 10))
 
@@ -198,6 +193,16 @@ class QuotexOTCApp(ctk.CTk):
         ctk.CTkButton(self.sel_btn_frame, text="Deselect All", height=25, command=self.deselect_all).pack(
             side="right", fill="x", expand=True, padx=(2, 0)
         )
+
+        self.clear_log_btn = ctk.CTkButton(
+            self.sidebar,
+            text="Clear Log",
+            command=self.clear_logs,
+            fg_color="#495057",
+            hover_color="#343a40",
+            height=35,
+        )
+        self.clear_log_btn.pack(fill="x", padx=20, pady=(0, 10))
 
         self.main_content = ctk.CTkFrame(self, fg_color="#121212", corner_radius=0)
         self.main_content.grid(row=0, column=1, sticky="nsew")
@@ -220,6 +225,8 @@ class QuotexOTCApp(ctk.CTk):
             ("Total Signals", "white"),
             ("Buy", "#28a745"),
             ("Sell", "#dc3545"),
+            ("Wins", "#20c997"),
+            ("Losses", "#fd7e14"),
             ("Accuracy", "#ffc107"),
             ("Latency", "#17a2b8"),
             ("Recovery Mode", "#dc3545"),
@@ -240,7 +247,7 @@ class QuotexOTCApp(ctk.CTk):
         self.table_header = ctk.CTkFrame(self.main_content, height=30, fg_color="#2d2d2d")
         self.table_header.grid(row=2, column=0, sticky="ew", padx=20, pady=(10, 0))
 
-        cols = ["Time", "Market", "TF", "Signal", "Quality", "Confidence", "Regime", "Reasons"]
+        cols = ["Time", "Market", "TF", "Signal", "Quality", "Confidence", "Regime", "Reasons", "Result"]
         for idx, col in enumerate(cols):
             self.table_header.grid_columnconfigure(idx, weight=1)
             ctk.CTkLabel(self.table_header, text=col, font=ctk.CTkFont(size=12, weight="bold")).grid(
@@ -259,15 +266,6 @@ class QuotexOTCApp(ctk.CTk):
         )
         self.log_text = ctk.CTkTextbox(self.log_frame, font=("Consolas", 11), fg_color="#0a0a0a", border_width=0)
         self.log_text.pack(fill="both", expand=True, padx=5, pady=5)
-
-    def open_chart(self):
-        selected = [pair for pair, value in self.pair_vars.items() if value.get()]
-        symbol = selected[0] if selected else "EUR/USD-OTC"
-        tradingview_symbol = symbol.replace("-OTC", "").replace("/", "")
-        market_prefix = "COMEX" if "XAU" in symbol or "XAG" in symbol else "FX_IDC"
-        url = f"https://www.tradingview.com/chart/?symbol={market_prefix}:{tradingview_symbol}"
-        webbrowser.open(url)
-        self.log(f"Opening TradingView for {symbol}")
 
     def update_market_list(self, category):
         for widget in self.pairs_scroll.winfo_children():
@@ -296,7 +294,31 @@ class QuotexOTCApp(ctk.CTk):
         self.log_text.insert("end", f"{timestamp} {message}\n")
         self.log_text.see("end")
 
+    def clear_logs(self):
+        self.log_text.delete("1.0", "end")
+        for widget in self.table_scroll.winfo_children():
+            widget.destroy()
+        self.storage.clear_cache()
+        self.signal_engine.reset_history()
+        self.total_signals = 0
+        self.win_count = 0
+        self.loss_count = 0
+        self.stat_labels["Total Signals"].configure(text="Total Signals: 0")
+        self.stat_labels["Buy"].configure(text="Buy: 0")
+        self.stat_labels["Sell"].configure(text="Sell: 0")
+        self.stat_labels["Wins"].configure(text="Wins: 0")
+        self.stat_labels["Losses"].configure(text="Losses: 0")
+        self.stat_labels["Accuracy"].configure(text="Confidence: 0%")
+        self.stat_labels["Latency"].configure(text="Latency: 0ms")
+        self.stat_labels["Recovery Mode"].configure(text="Recovery: OFF", text_color="#28a745")
+        self.stat_labels["Regime"].configure(text="Regime: 0")
+        self.log("Log and saved signals cleared")
+
     def start_bot(self):
+        if self.running:
+            self.log("Bot is already running")
+            return
+
         self.active_pairs = [pair for pair, value in self.pair_vars.items() if value.get()]
         if not self.active_pairs:
             self.log("Error: Please select at least one market")
@@ -313,6 +335,10 @@ class QuotexOTCApp(ctk.CTk):
         self.log(f"Starting bot with {len(self.active_pairs)} markets")
         self.log(f"Markets: {', '.join(self.active_pairs)}")
         self.log(f"Connecting to {self.source_var.get()}")
+        if not getattr(self.connector, "api_key", ""):
+            self.log("Missing TWELVE_DATA_API_KEY. Add it in config/api_keys.env")
+            self.stop_bot()
+            return
         self.log("=" * 50)
 
         self.connector.start_websocket(self.active_pairs)
@@ -357,6 +383,26 @@ class QuotexOTCApp(ctk.CTk):
 
             try:
                 tf_val = int(self.timeframe_var.get())
+                now_ts = time.time()
+                seconds_until_boundary = tf_val - (now_ts % tf_val)
+                trigger_wait = seconds_until_boundary - self.safety_margin_seconds
+                if trigger_wait <= 0:
+                    trigger_wait += tf_val
+
+                next_trigger = datetime.fromtimestamp(now_ts + trigger_wait)
+                self.log(
+                    f"Next scan at {next_trigger.strftime('%H:%M:%S')} "
+                    f"({self.safety_margin_seconds}s before candle close)"
+                )
+                await asyncio.sleep(trigger_wait)
+
+                candle_bucket = int(time.time() // tf_val)
+                if self.scan_in_progress or self.last_scan_bucket == candle_bucket:
+                    await asyncio.sleep(1)
+                    continue
+
+                self.scan_in_progress = True
+                self.last_scan_bucket = candle_bucket
                 self.log(f"Scan trigger: {datetime.now().strftime('%H:%M:%S')}")
                 signals = []
 
@@ -371,22 +417,57 @@ class QuotexOTCApp(ctk.CTk):
                         continue
 
                     signal = self.signal_engine.generate_signal(pair, indicators, str(tf_val), df, mtf_trend)
-                    signals.append(signal)
                     self.storage.save_price(pair, indicators["current_price"])
-                    self.storage.save_signal(signal)
+                    if signal["signal"] != "HOLD":
+                        signals.append(signal)
+                        self.storage.save_signal(signal)
 
                 if signals:
                     self.update_dashboard(signals)
                 else:
                     self.log("No market data available for this scan")
 
-                await asyncio.sleep(tf_val)
+                await asyncio.sleep(1)
             except Exception as exc:
                 self.log(f"Analysis error: {exc}")
                 await asyncio.sleep(2)
+            finally:
+                self.scan_in_progress = False
 
     def update_dashboard(self, signals: List[Dict]):
         self.after(0, lambda: self._update_ui_safe(signals))
+
+    def mark_signal_result(self, signal: Dict, result: str, status_label, w_button, l_button):
+        previous = signal.get("manual_result")
+        if previous == result:
+            return
+
+        if previous == "W":
+            self.win_count = max(0, self.win_count - 1)
+        elif previous == "L":
+            self.loss_count = max(0, self.loss_count - 1)
+
+        signal["manual_result"] = result
+        self.storage.update_signal_result(signal["signal_id"], result)
+
+        if result == "W":
+            self.win_count += 1
+            status_label.configure(text="W", text_color="#20c997")
+        else:
+            self.loss_count += 1
+            status_label.configure(text="L", text_color="#fd7e14")
+
+        w_button.configure(state="disabled" if result == "W" else "normal")
+        l_button.configure(state="disabled" if result == "L" else "normal")
+        self.refresh_result_stats()
+        self.log(f"Marked {signal['symbol']} {signal['signal']} as {result}")
+
+    def refresh_result_stats(self):
+        self.stat_labels["Wins"].configure(text=f"Wins: {self.win_count}")
+        self.stat_labels["Losses"].configure(text=f"Losses: {self.loss_count}")
+        decided = self.win_count + self.loss_count
+        win_rate = round((self.win_count / decided) * 100, 1) if decided else 0
+        self.stat_labels["Accuracy"].configure(text=f"Win Rate: {win_rate}%")
 
     def _update_ui_safe(self, signals: List[Dict]):
         summary = self.signal_engine.get_signals_summary(signals)
@@ -397,7 +478,7 @@ class QuotexOTCApp(ctk.CTk):
         self.stat_labels["Total Signals"].configure(text=f"Total Signals: {self.total_signals}")
         self.stat_labels["Buy"].configure(text=f"Buy: {summary['buy_count']}")
         self.stat_labels["Sell"].configure(text=f"Sell: {summary['sell_count']}")
-        self.stat_labels["Accuracy"].configure(text=f"Confidence: {summary['avg_confidence']}%")
+        self.refresh_result_stats()
         self.stat_labels["Latency"].configure(text=f"Latency: {self.connector.get_latency()}ms")
         self.stat_labels["Recovery Mode"].configure(
             text=f"Recovery: {'ON' if summary['recovery_mode'] else 'OFF'}",
@@ -415,7 +496,7 @@ class QuotexOTCApp(ctk.CTk):
 
             row_frame = ctk.CTkFrame(self.table_scroll, fg_color="#242424", corner_radius=5)
             row_frame.pack(fill="x", pady=2, padx=5)
-            for idx in range(8):
+            for idx in range(9):
                 row_frame.grid_columnconfigure(idx, weight=1)
 
             sig_color = "#28a745" if signal["signal"] == "BUY" else "#dc3545"
@@ -438,6 +519,23 @@ class QuotexOTCApp(ctk.CTk):
             ctk.CTkLabel(row_frame, text=signal["reasons"], font=ctk.CTkFont(size=10), text_color="gray").grid(
                 row=0, column=7
             )
+            result_frame = ctk.CTkFrame(row_frame, fg_color="transparent")
+            result_frame.grid(row=0, column=8, padx=4)
+            status_label = ctk.CTkLabel(result_frame, text=signal.get("manual_result", "-"), width=18)
+            status_label.pack(side="left", padx=(0, 4))
+            w_button = ctk.CTkButton(result_frame, text="W", width=28, height=24, fg_color="#20c997", hover_color="#198754")
+            l_button = ctk.CTkButton(result_frame, text="L", width=28, height=24, fg_color="#fd7e14", hover_color="#e67700")
+            w_button.configure(command=lambda s=signal, lbl=status_label, wb=w_button, lb=l_button: self.mark_signal_result(s, "W", lbl, wb, lb))
+            l_button.configure(command=lambda s=signal, lbl=status_label, wb=w_button, lb=l_button: self.mark_signal_result(s, "L", lbl, wb, lb))
+            w_button.pack(side="left", padx=1)
+            l_button.pack(side="left", padx=1)
+
+            if signal.get("manual_result") == "W":
+                status_label.configure(text="W", text_color="#20c997")
+                w_button.configure(state="disabled")
+            elif signal.get("manual_result") == "L":
+                status_label.configure(text="L", text_color="#fd7e14")
+                l_button.configure(state="disabled")
 
             if signal["recovery_active"]:
                 self.log(f"[RECOVERY] {signal['symbol']} -> {signal['signal']} ({signal['confidence']}%)")

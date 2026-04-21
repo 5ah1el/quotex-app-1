@@ -1,6 +1,5 @@
 import os
 import json
-import pandas as pd
 from datetime import datetime
 from typing import Dict, List, Optional
 
@@ -42,6 +41,23 @@ class DataStorage:
         except Exception as e:
             print(f"Error saving signals: {e}")
 
+    def update_signal_result(self, signal_id: str, result: str):
+        updated = False
+        for signal in self.signal_cache:
+            if signal.get("signal_id") == signal_id:
+                signal["manual_result"] = result
+                updated = True
+                break
+
+        if not updated:
+            return
+
+        try:
+            with open(self.signals_file, 'w') as f:
+                json.dump(self.signal_cache, f, indent=2)
+        except Exception as e:
+            print(f"Error updating signal result: {e}")
+
     def get_historical_prices(self, symbol: str, limit: int = 100) -> List[Dict]:
         return self.price_cache.get(symbol, [])[-limit:]
 
@@ -53,3 +69,10 @@ class DataStorage:
     def clear_cache(self):
         self.price_cache = {}
         self.signal_cache = []
+        try:
+            with open(self.signals_file, 'w') as f:
+                json.dump([], f, indent=2)
+            with open(self.prices_file, 'w') as f:
+                f.write("symbol,price,timestamp\n")
+        except Exception as e:
+            print(f"Error clearing cache: {e}")

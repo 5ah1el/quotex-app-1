@@ -13,6 +13,7 @@ class SignalEngine:
         self.signal_history: List[Dict] = []
         self.consecutive_losses = 0
         self.recovery_mode = False
+        self.last_signal_by_symbol: Dict[str, Dict] = {}
 
     def calculate_trend_score(self, indicators: dict) -> float:
         score = 0.0
@@ -141,7 +142,7 @@ class SignalEngine:
             self.recovery_mode = False
 
     def detect_candle_patterns(self, df: pd.DataFrame) -> List[str]:
-        """Detect high-probability candle patterns on live crypto candles."""
+        """Detect high-probability candle patterns on live OTC candles."""
         if df is None or len(df) < 5: return []
         
         patterns = []
@@ -269,6 +270,8 @@ class SignalEngine:
         rsi = indicators.get('rsi', 50)
         macd = indicators.get('macd', 0)
         macd_sig = indicators.get('macd_signal', 0)
+        sma_20 = indicators.get('sma_20', current_price)
+        sma_50 = indicators.get('sma_50', current_price)
         bb_upper = indicators.get('bb_upper', 0)
         bb_lower = indicators.get('bb_lower', 0)
 
@@ -276,6 +279,16 @@ class SignalEngine:
         direction = 'NONE'
         confidence = 0.0
         reasons = []
+
+        last_open = float(df['open'].iloc[-1]) if df is not None and len(df) else current_price
+        last_close = float(df['close'].iloc[-1]) if df is not None and len(df) else current_price
+        prev_close = float(df['close'].iloc[-2]) if df is not None and len(df) > 1 else current_price
+        short_momentum_up = last_close > last_open and last_close > prev_close
+        short_momentum_down = last_close < last_open and last_close < prev_close
+        bull_cross = macd > macd_sig
+        bear_cross = macd < macd_sig
+        bullish_trend = current_price > sma_20 > sma_50
+        bearish_trend = current_price < sma_20 < sma_50
 
         # Volatility Protection
         if inst_zones.get("is_spiky", False):
@@ -289,6 +302,9 @@ class SignalEngine:
         # Bullish Score (Max 25)
         bull_score = 0
         if trend_score > 15: bull_score += 1
+        if bullish_trend: bull_score += 2
+        if bull_cross: bull_score += 2
+        if short_momentum_up: bull_score += 1.5
         if smc.get("structure") == "BOS_UP": bull_score += 2
         if "BULLISH_HAMMER" in candle_patterns: bull_score += 2
         if "BULLISH_ENGULFING" in candle_patterns: bull_score += 2
@@ -301,21 +317,21 @@ class SignalEngine:
         ob_bull = inst_zones.get("bullish_ob")
         if ob_bull and current_price <= ob_bull['high'] and current_price >= ob_bull['low']:
             bull_score += 3.5 
-            
-        # Fibonacci Confluence
-        if current_price <= inst_zones.get("fib_618", 0) or current_price <= inst_zones.get("fib_786", 0):
-            bull_score += 2
-            
+
         if "COLOR_FLIP_REVERSAL_UP" in candle_patterns: bull_score += 1.5
         if candle_5_logic.get("sequence") == "EXHAUSTION_BEARISH": bull_score += 3
         if candle_5_logic.get("sequence") == "MOMENTUM_BULLISH": bull_score += 2
         if current_price <= bb_lower: bull_score += 2 
-        if rsi < 30: bull_score += 2 
+        if 42 <= rsi <= 68: bull_score += 1.5
+        if rsi < 30: bull_score += 2
         if "LIQUIDITY_GRAB_LOW" in inst_logic: bull_score += 2
 
         # Bearish Score (Max 25)
         bear_score = 0
         if trend_score < -15: bear_score += 1
+        if bearish_trend: bear_score += 2
+        if bear_cross: bear_score += 2
+        if short_momentum_down: bear_score += 1.5
         if smc.get("structure") == "BOS_DOWN": bear_score += 2
         if "BEARISH_STAR" in candle_patterns: bear_score += 2
         if "BEARISH_ENGULFING" in candle_patterns: bear_score += 2
@@ -328,20 +344,27 @@ class SignalEngine:
         ob_bear = inst_zones.get("bearish_ob")
         if ob_bear and current_price >= ob_bear['low'] and current_price <= ob_bear['high']:
             bear_score += 3.5
-            
-        # Fibonacci Confluence
-        if current_price >= inst_zones.get("fib_618", 0) or current_price >= inst_zones.get("fib_786", 0):
-            bear_score += 2
-            
+
         if "COLOR_FLIP_REVERSAL_DOWN" in candle_patterns: bear_score += 1.5
         if candle_5_logic.get("sequence") == "EXHAUSTION_BULLISH": bear_score += 3
         if candle_5_logic.get("sequence") == "MOMENTUM_BEARISH": bear_score += 2
         if current_price >= bb_upper: bear_score += 2 
-        if rsi > 70: bear_score += 2 
+        if 32 <= rsi <= 58: bear_score += 1.5
+        if rsi > 70: bear_score += 2
         if "LIQUIDITY_GRAB_HIGH" in inst_logic: bear_score += 2
 
-        # Use a lower normal threshold so live crypto scans surface signals more often.
-        threshold = 6.5 if self.recovery_mode else 3.0
+        # Require some real agreement so the engine stops forcing one-sided signals.
+        if not bull_cross:
+            bull_score -= 1.5
+        if not bear_cross:
+            bear_score -= 1.5
+        if bullish_trend and short_momentum_down:
+            bull_score -= 1
+        if bearish_trend and short_momentum_up:
+            bear_score -= 1
+
+        score_gap = abs(bull_score - bear_score)
+        threshold = 7.0 if self.recovery_mode else 5.5
         
         if bull_score > bear_score and bull_score >= threshold:
             signal_type = 'BUY'
@@ -350,8 +373,9 @@ class SignalEngine:
             confidence = min(99.0, base_conf + (min(bull_score, 25) * 1.2))
             reasons = [r.replace('_', ' ') for r in candle_patterns + inst_logic if "UP" in r or "LOW" in r or "BULLISH" in r]
             if mtf_trend == "BULLISH": reasons.append("MTF Trend")
+            if bullish_trend: reasons.append("Trend Structure")
+            if bull_cross: reasons.append("MACD Cross")
             if ob_bull: reasons.append("Demand Zone")
-            if current_price <= inst_zones.get("fib_618", 0): reasons.append("Fib 0.618")
             if "VELOCITY_UP" in inst_logic:
                 reasons.append("Momentum")
             if not reasons:
@@ -363,15 +387,36 @@ class SignalEngine:
             confidence = min(99.0, base_conf + (min(bear_score, 25) * 1.2))
             reasons = [r.replace('_', ' ') for r in candle_patterns + inst_logic if "DOWN" in r or "HIGH" in r or "BEARISH" in r]
             if mtf_trend == "BEARISH": reasons.append("MTF Trend")
+            if bearish_trend: reasons.append("Trend Structure")
+            if bear_cross: reasons.append("MACD Cross")
             if ob_bear: reasons.append("Supply Zone")
-            if current_price >= inst_zones.get("fib_618", 0): reasons.append("Fib 0.618")
             if "VELOCITY_DOWN" in inst_logic:
                 reasons.append("Momentum")
             if not reasons:
                 reasons = ["Trend + momentum alignment"]
 
+        if signal_type != 'HOLD' and score_gap < 2.5:
+            signal_type = 'HOLD'
+            direction = 'NONE'
+            confidence = 0.0
+            reasons = ["Weak directional edge"]
+
+        cooldown_minutes = max(1, int(timeframe) // 60) if timeframe.isdigit() else 1
+        last_symbol_signal = self.last_signal_by_symbol.get(symbol)
+        if signal_type != 'HOLD' and last_symbol_signal:
+            prev_time = datetime.fromisoformat(last_symbol_signal['timestamp'])
+            current_time = datetime.now()
+            same_direction = last_symbol_signal['signal'] == signal_type
+            within_cooldown = (current_time - prev_time).total_seconds() < cooldown_minutes * 60
+            if same_direction and within_cooldown:
+                signal_type = 'HOLD'
+                direction = 'NONE'
+                confidence = 0.0
+                reasons = ["Cooldown active after previous signal"]
+
         # Final signal assembly
         signal = {
+            'signal_id': f"{symbol}|{datetime.now().isoformat()}",
             'symbol': symbol,
             'signal': signal_type,
             'direction': direction,
@@ -385,6 +430,8 @@ class SignalEngine:
         }
 
         self.signal_history.append(signal)
+        if signal_type != 'HOLD':
+            self.last_signal_by_symbol[symbol] = signal
         return signal
 
     def get_signals_summary(self, signals: List[Dict]) -> Dict:
@@ -400,3 +447,9 @@ class SignalEngine:
             'total_signals': len(signals),
             'recovery_mode': self.recovery_mode
         }
+
+    def reset_history(self):
+        self.signal_history = []
+        self.consecutive_losses = 0
+        self.recovery_mode = False
+        self.last_signal_by_symbol = {}
