@@ -255,6 +255,67 @@ class SignalEngine:
 
         return {"sequence": sequence}
 
+    def generate_signal_from_prediction(
+        self,
+        symbol: str,
+        prediction: Dict,
+        indicators: dict,
+        timeframe: str = '1m',
+        df: Optional[pd.DataFrame] = None,
+        mtf_trend: str = "NEUTRAL",
+    ) -> Dict:
+        current_price = indicators.get('current_price', 0)
+        self.track_outcomes(current_price)
+
+        smc = self.calculate_smc_patterns(df) if df is not None else {}
+        signal_type = prediction.get("direction", "NEUTRAL")
+        confidence_ratio = float(prediction.get("confidence", 0.0))
+        reasons = prediction.get("reasons", [])
+
+        if signal_type not in {"BUY", "SELL"} or confidence_ratio < 0.55:
+            signal_type = "HOLD"
+            direction = "NONE"
+            confidence = 0.0
+            reasons_text = prediction.get("reason", "Analyzing...")
+        else:
+            direction = "UP" if signal_type == "BUY" else "DOWN"
+            confidence = round(min(99.0, confidence_ratio * 100), 1)
+            reasons_text = ", ".join(reasons[:5]) if reasons else "Advanced predictor alignment"
+
+        cooldown_minutes = max(1, int(timeframe) // 60) if timeframe.isdigit() else 1
+        last_symbol_signal = self.last_signal_by_symbol.get(symbol)
+        if signal_type != 'HOLD' and last_symbol_signal:
+            prev_time = datetime.fromisoformat(last_symbol_signal['timestamp'])
+            current_time = datetime.now()
+            same_direction = last_symbol_signal['signal'] == signal_type
+            within_cooldown = (current_time - prev_time).total_seconds() < cooldown_minutes * 60
+            if same_direction and within_cooldown:
+                signal_type = 'HOLD'
+                direction = 'NONE'
+                confidence = 0.0
+                reasons_text = "Cooldown active after previous signal"
+
+        signal = {
+            'signal_id': f"{symbol}|{datetime.now().isoformat()}",
+            'symbol': symbol,
+            'signal': signal_type,
+            'direction': direction,
+            'confidence': confidence if signal_type != 'HOLD' else 0,
+            'regime': smc.get("regime", "RANGING"),
+            'reasons': reasons_text,
+            'price': current_price,
+            'timestamp': datetime.now().isoformat(),
+            'recovery_active': self.recovery_mode,
+            'indicators': indicators,
+            'prediction': prediction,
+            'mtf_trend': mtf_trend,
+        }
+
+        self.signal_history.append(signal)
+        if signal_type != 'HOLD':
+            self.last_signal_by_symbol[symbol] = signal
+        return signal
+
     def generate_signal(self, symbol: str, indicators: dict, timeframe: str = '1m', df: Optional[pd.DataFrame] = None, mtf_trend: str = "NEUTRAL") -> Dict:
         # First, track outcome of previous trades
         current_price = indicators.get('current_price', 0)

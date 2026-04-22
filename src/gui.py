@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import os
 import sys
 import threading
@@ -12,6 +13,7 @@ from dotenv import load_dotenv
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), "..", "config", "api_keys.env"))
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from src.automation.advanced_predictor import AdvancedOTCPredictor
 from src.data_storage import DataStorage
 from src.signal_engine import SignalEngine
 from src.twelve_data_connector import TwelveDataConnector
@@ -20,6 +22,20 @@ ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
 PAIRS = {
+    "Live Forex": [
+        "EUR/USD",
+        "GBP/USD",
+        "USD/JPY",
+        "AUD/USD",
+        "USD/CAD",
+        "NZD/USD",
+        "USD/CHF",
+        "EUR/GBP",
+    ],
+    "Live Metals": [
+        "XAU/USD",
+        "XAG/USD",
+    ],
     "Major Currency OTC": [
         "EUR/USD-OTC",
         "GBP/USD-OTC",
@@ -56,6 +72,15 @@ class QuotexOTCApp(ctk.CTk):
         self.connector = TwelveDataConnector()
         self.signal_engine = SignalEngine()
         self.storage = DataStorage()
+        self.predictor = AdvancedOTCPredictor(
+            config={
+                "prediction.model_type": "advanced_otc",
+                "prediction.confidence_threshold": 0.60,
+                "prediction.lookback_period": 20,
+                "prediction.min_data_points": 50,
+            },
+            logger=logging.getLogger(__name__),
+        )
 
         self.active_pairs: List[str] = []
         self.running = False
@@ -68,9 +93,9 @@ class QuotexOTCApp(ctk.CTk):
         self.last_scan_bucket = None
 
         self.status_var = ctk.StringVar(value="Status: Stopped")
-        self.market_var = ctk.StringVar(value="Data: LIVE Forex Proxy for OTC")
+        self.market_var = ctk.StringVar(value="Mode: Live Markets")
         self.timeframe_var = ctk.StringVar(value="60")
-        self.source_var = ctk.StringVar(value="Twelve Data Polling (Live Forex/Metals Proxy)")
+        self.source_var = ctk.StringVar(value="Twelve Data Polling")
 
         self.setup_ui()
 
@@ -176,13 +201,13 @@ class QuotexOTCApp(ctk.CTk):
 
         self.market_tabs = ctk.CTkSegmentedButton(self.sidebar, values=list(PAIRS.keys()), command=self.update_market_list)
         self.market_tabs.pack(fill="x", padx=10, pady=5)
-        self.market_tabs.set("Major Currency OTC")
+        self.market_tabs.set("Live Forex")
 
         self.pairs_scroll = ctk.CTkScrollableFrame(self.sidebar, height=180, fg_color="#1a1a1a")
         self.pairs_scroll.pack(fill="both", expand=True, padx=10, pady=5)
 
         self.pair_vars: Dict[str, ctk.BooleanVar] = {}
-        self.update_market_list("Major Currency OTC")
+        self.update_market_list("Live Forex")
 
         self.sel_btn_frame = ctk.CTkFrame(self.sidebar, fg_color="transparent")
         self.sel_btn_frame.pack(fill="x", padx=10, pady=(5, 10))
@@ -268,6 +293,7 @@ class QuotexOTCApp(ctk.CTk):
         self.log_text.pack(fill="both", expand=True, padx=5, pady=5)
 
     def update_market_list(self, category):
+        self.update_market_mode(category)
         for widget in self.pairs_scroll.winfo_children():
             widget.destroy()
 
@@ -280,6 +306,14 @@ class QuotexOTCApp(ctk.CTk):
                 variable=self.pair_vars[pair],
                 font=ctk.CTkFont(size=12),
             ).pack(anchor="w", padx=10, pady=2)
+
+    def update_market_mode(self, category: str):
+        is_otc = "OTC" in category
+        self.market_var.set("Mode: OTC Markets" if is_otc else "Mode: Live Markets")
+        if is_otc:
+            self.source_var.set("Twelve Data Polling (Live Forex/Metals Proxy For OTC Labels)")
+        else:
+            self.source_var.set("Twelve Data Polling (Live Forex/Metals)")
 
     def select_all(self):
         for pair in PAIRS[self.market_tabs.get()]:
@@ -374,6 +408,27 @@ class QuotexOTCApp(ctk.CTk):
         asyncio.set_event_loop(loop)
         loop.run_until_complete(self.continuous_analysis())
 
+    def _build_candle_history(self, df, timeframe_seconds: int):
+        now_ts = time.time()
+        time_left = int(max(0, timeframe_seconds - (now_ts % timeframe_seconds)))
+        candle_history = []
+
+        for idx, row in df.iterrows():
+            is_last = idx == len(df) - 1
+            candle_history.append(
+                {
+                    "open": float(row["open"]),
+                    "high": float(row["high"]),
+                    "low": float(row["low"]),
+                    "close": float(row["close"]),
+                    "volume": float(row.get("volume", 1.0)),
+                    "datetime": row["datetime"].isoformat() if hasattr(row["datetime"], "isoformat") else str(row["datetime"]),
+                    "is_closed": not is_last,
+                    "time_left": time_left if is_last else 0,
+                }
+            )
+        return candle_history
+
     async def continuous_analysis(self):
         self.log("Live scan ready")
         while self.running:
@@ -416,11 +471,22 @@ class QuotexOTCApp(ctk.CTk):
                     if not indicators:
                         continue
 
-                    signal = self.signal_engine.generate_signal(pair, indicators, str(tf_val), df, mtf_trend)
+                    candle_history = self._build_candle_history(df, tf_val)
+                    prediction = await self.predictor.predict(pair, str(tf_val), candle_history)
+                    signal = self.signal_engine.generate_signal_from_prediction(
+                        pair,
+                        prediction,
+                        indicators,
+                        str(tf_val),
+                        df,
+                        mtf_trend,
+                    )
                     self.storage.save_price(pair, indicators["current_price"])
                     if signal["signal"] != "HOLD":
                         signals.append(signal)
                         self.storage.save_signal(signal)
+                    elif prediction.get("direction") == "WAITING":
+                        self.log(f"{pair}: {prediction.get('reason', 'Waiting for close')}")
 
                 if signals:
                     self.update_dashboard(signals)
