@@ -454,23 +454,22 @@ class QuotexOTCApp(ctk.CTk):
                     f"({self.safety_margin_seconds}s before candle close)"
                 )
                 
-                # Sleep in small increments to allow thread to exit if stopped
-                slept = 0
-                while slept < trigger_wait and self.running:
-                    sleep_step = min(1.0, trigger_wait - slept)
-                    await asyncio.sleep(sleep_step)
-                    slept += sleep_step
+                # Use absolute time to avoid sleep drift
+                target_time = now_ts + trigger_wait
+                while time.time() < target_time and self.running:
+                    await asyncio.sleep(min(1.0, target_time - time.time()))
                     
                 if not self.running:
                     break
 
-                candle_bucket = int(time.time() // tf_val)
-                if self.scan_in_progress or self.last_scan_bucket == candle_bucket:
+                # Use the target trigger time for bucket tracking so we don't accidentally skip the 57s mark
+                target_bucket = int((now_ts + self.safety_margin_seconds + 1) // tf_val)
+                if self.scan_in_progress or self.last_scan_bucket == target_bucket:
                     await asyncio.sleep(1)
                     continue
 
                 self.scan_in_progress = True
-                self.last_scan_bucket = candle_bucket
+                self.last_scan_bucket = target_bucket
                 self.log(f"Scan trigger: {datetime.now().strftime('%H:%M:%S')}")
                 signals = []
 
