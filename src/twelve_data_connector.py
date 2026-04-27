@@ -28,6 +28,7 @@ class TwelveDataConnector:
         "EUR/CHF": "EUR/CHF",
         "GBP/AUD": "GBP/AUD",
         "GBP/CHF": "GBP/CHF",
+        "EUR/JPY": "EUR/JPY",
         "USD/INR": "USD/INR",
         "XAU/USD": "XAU/USD",
         "XAG/USD": "XAG/USD",
@@ -47,12 +48,15 @@ class TwelveDataConnector:
         "GBP/AUD-OTC": "GBP/AUD",
         "GBP/CHF-OTC": "GBP/CHF",
         "USD/INR-OTC": "USD/INR",
+        "USD/PKR-OTC": "USD/PKR",
+        "USD/BRL-OTC": "USD/BRL",
+        "USD/ARS-OTC": "USD/ARS",
         "XAU/USD-OTC": "XAU/USD",
         "XAG/USD-OTC": "XAG/USD",
     }
 
     def __init__(self, api_key: Optional[str] = None):
-        self.api_key = api_key or os.getenv("TWELVE_DATA_API_KEY", "").strip()
+        self.api_key = api_key or os.getenv("TWELVE_DATA_API_KEY", "f900f16a00fb47fe9b5ce42d1d839257").strip()
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": "Mozilla/5.0 (QuotexOTCBot/1.0)"})
         self.last_fetch_time = time.time()

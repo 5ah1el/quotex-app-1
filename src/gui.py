@@ -31,6 +31,7 @@ PAIRS = {
         "NZD/USD",
         "USD/CHF",
         "EUR/GBP",
+        "EUR/JPY",
     ],
     "Live Metals": [
         "XAU/USD",
@@ -55,6 +56,9 @@ PAIRS = {
         "GBP/AUD-OTC",
         "GBP/CHF-OTC",
         "USD/INR-OTC",
+        "USD/PKR-OTC",
+        "USD/BRL-OTC",
+        "USD/ARS-OTC",
         "XAU/USD-OTC",
         "XAG/USD-OTC",
     ],
@@ -449,7 +453,16 @@ class QuotexOTCApp(ctk.CTk):
                     f"Next scan at {next_trigger.strftime('%H:%M:%S')} "
                     f"({self.safety_margin_seconds}s before candle close)"
                 )
-                await asyncio.sleep(trigger_wait)
+                
+                # Sleep in small increments to allow thread to exit if stopped
+                slept = 0
+                while slept < trigger_wait and self.running:
+                    sleep_step = min(1.0, trigger_wait - slept)
+                    await asyncio.sleep(sleep_step)
+                    slept += sleep_step
+                    
+                if not self.running:
+                    break
 
                 candle_bucket = int(time.time() // tf_val)
                 if self.scan_in_progress or self.last_scan_bucket == candle_bucket:
